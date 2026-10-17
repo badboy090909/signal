@@ -502,7 +502,7 @@
     try { data = JSON.parse(raw); } catch (_) {
       throw new Error(res.status === 504 ? "時間切れになりました。もう一度お願いします" : `サーバーの応答が不正です（${res.status}）`);
     }
-    if (!res.ok) throw new Error(data.error || "エラー");
+    if (!res.ok) throw new Error((data.error || "エラー") + (data.detail ? "（" + String(data.detail).slice(0, 220) + "）" : ""));
     return data;
   }
 
