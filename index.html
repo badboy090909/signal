@@ -224,7 +224,8 @@
     set_reminder:"リマインダー", cancel_alarm:"取消", remember:"記憶", forget:"忘却", add_memo:"メモ", delete_memo:"メモ削除",
     get_market_overview:"市況", get_quotes:"株価", analyze_stock:"テクニカル", get_fundamentals:"財務", compare_assets:"比較",
     get_sector_performance:"業種", search_symbol:"銘柄検索", get_watchlist:"ウォッチ", add_watchlist:"ウォッチ追加",
-    remove_watchlist:"ウォッチ削除", set_price_alert:"価格アラート", cancel_price_alert:"アラート取消" };
+    remove_watchlist:"ウォッチ削除", set_price_alert:"価格アラート", cancel_price_alert:"アラート取消",
+    watchlist:"ウォッチ", price_alert:"価格アラート", alarm:"タイマー", notes:"メモ・記憶" };
   const setMode = (m) => {
     mode = m;
     $("state").textContent = tapMode && m === "standby" ? "TAP TO TALK" : LABEL[m];
