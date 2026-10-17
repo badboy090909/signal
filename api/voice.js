@@ -13,13 +13,14 @@
 const market = require("./_market.js");
 
 const GROQ = "https://api.groq.com/openai/v1";
-const REASONING = process.env.GROQ_REASONING_EFFORT || "medium";   // low / medium / high（高いほど深く考えるが遅い）
+const REASONING = process.env.GROQ_REASONING_EFFORT || "low";   // low / medium / high（高いほど深く考えるが、遅く・多くのトークンを使う）
+const MAX_TOKENS = +process.env.GROQ_MAX_TOKENS || 1400;           // 返事に使う上限（無料枠では大きくしすぎると1分あたりの上限に当たる）
 const TZ = "Asia/Tokyo";
 const JST_OFFSET = 9 * 3600e3;
 const DAY = 864e5;
 
 const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || "openai/gpt-oss-120b";
-const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL || "llama-3.3-70b-versatile";
+const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL || "openai/gpt-oss-20b";   // llama-3.3-70b は2026年8月で一般提供終了
 const SEARCH_MODEL = process.env.GROQ_SEARCH_MODEL || "groq/compound-mini";
 const STT_MODEL = process.env.GROQ_STT_MODEL || "whisper-large-v3-turbo";
 const USER_NAME = process.env.USER_NAME || "";
@@ -56,24 +57,53 @@ async function groqChat(key, body) {
     body: JSON.stringify(body),
   });
   const text = await r.text();
-  if (!r.ok) throw new Error(`Groq ${r.status}: ${text.slice(0, 300)}`);
+  if (!r.ok) {
+    const e = new Error(`Groq ${r.status}: ${text.slice(0, 300)}`);
+    e.status = r.status;
+    const m = /try again in ([\d.]+)s/i.exec(text);
+    e.wait = r.headers.get("retry-after") ? +r.headers.get("retry-after") : m ? +m[1] : null;
+    throw e;
+  }
   return JSON.parse(text);
 }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// メインモデルで失敗したら予備モデルで再挑戦
+// Groqのエラーを、分かる日本語にする
+function explainGroqError(e) {
+  const t = String(e && e.message || e);
+  if (/model_not_found|does not exist/.test(t)) return `モデルが見つかりません（${(/`([^`]+)`/.exec(t) || [])[1] || "不明"}）。Vercelの環境変数 GROQ_CHAT_MODEL / GROQ_FALLBACK_MODEL を確認してください`;
+  if (/ 401:|invalid_api_key|Invalid API Key/i.test(t)) return "GroqのAPIキーが正しくありません。Vercelの GROQ_API_KEY を確認してください";
+  if (/ 413:|too large|tokens per minute|TPM/i.test(t)) return "Groqの無料枠の上限（1分あたりのトークン数）を超えました。1分ほど待ってからもう一度話しかけるか、Groqの有料プラン（Developer）にすると解消します";
+  if (/ 429:|rate_limit|requests per/i.test(t)) return "Groqの利用回数の上限に当たりました。少し待ってからもう一度お願いします（頻繁なら有料プランをおすすめします）";
+  if (/tool_use_failed|Failed to call a function/i.test(t)) return "AIが道具の呼び出しに失敗しました。言い方を変えてもう一度お願いします";
+  return t.slice(0, 200);
+}
+
+// メインモデルで失敗したら予備モデルで再挑戦。上限エラーは少し待ってやり直す
 async function chat(key, messages, tools, noTools) {
   const models = [CHAT_MODEL, FALLBACK_MODEL].filter((m, i, a) => m && a.indexOf(m) === i);
-  let lastErr;
+  const errs = [];
+  let lastFriendly = "不明なエラー";
   for (const model of models) {
-    const body = { model, messages, temperature: 0.3, max_completion_tokens: 3500 };
+    const body = { model, messages, temperature: 0.3, max_completion_tokens: MAX_TOKENS };
     if (tools && tools.length) { body.tools = tools; body.tool_choice = noTools ? "none" : "auto"; }
     if (/gpt-oss/.test(model)) body.reasoning_effort = REASONING;
-    try {
-      const j = await groqChat(key, body);
-      return (j.choices && j.choices[0] && j.choices[0].message) || {};
-    } catch (e) { lastErr = e; }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const j = await groqChat(key, body);
+        return (j.choices && j.choices[0] && j.choices[0].message) || {};
+      } catch (e) {
+        errs.push(`${model}: ${String(e.message || e).replace(/^Groq /, "").slice(0, 120)}`);
+        lastFriendly = explainGroqError(e);
+        if (e.status === 429 && e.wait != null && e.wait <= 12 && attempt === 0) { await sleep(e.wait * 1000 + 300); continue; }
+        if (e.status === 413 && attempt === 0) { body.max_completion_tokens = 700; continue; }   // 大きすぎる → 返事の枠を減らして再挑戦
+        break;
+      }
+    }
   }
-  throw lastErr;
+  const err = new Error(errs.join(" ／ "));
+  err.friendly = lastFriendly;
+  throw err;
 }
 
 async function transcribe(key, buf, mime) {
@@ -99,87 +129,38 @@ function toolDefs() {
     type: "function",
     function: { name, description, parameters: { type: "object", properties, required } },
   });
-  const SYM = "銘柄コード。日本株は証券コード＋.T（例: 7203.T）、米国株はティッカー（例: NVDA）、指数は ^N225 / ^GSPC / ^IXIC / ^DJI / ^SOX、為替は USDJPY=X、金利は ^TNX、商品は GC=F / CL=F、暗号資産は BTC-USD。分からなければ先に search_symbol";
+  const S = { type: "string", description: "銘柄コード" };
+  const SS = { type: "array", items: { type: "string" }, description: "銘柄コードの配列" };
+  const P = { type: "string", description: "1d/1w/1m/3m/6m/1y/ytd" };
   const list = [
-    fn("get_market_overview", "世界の市況を一覧で取得する（主要株価指数・為替・米国債利回り・商品・暗号資産の現在値と前日比）。「今日の相場は？」「世界の市場どう？」に使う。", {
-      region: { type: "string", description: "all / japan / us / europe / asia / fx / rates / commodities / crypto（カンマ区切りで複数可）。省略時は all" },
+    fn("get_market_overview", "世界の市況一覧（株価指数・為替・米金利・商品・暗号資産の現在値と前日比）", { region: { type: "string", description: "all/japan/us/europe/asia/fx/rates/commodities/crypto" } }),
+    fn("get_quotes", "現在値と前日比（最大12件）", { symbols: SS }, ["symbols"]),
+    fn("analyze_stock", "テクニカル分析（騰落率・移動平均・RSI・MACD・ボリンジャー・ボラ・高安・出来高・ベータ、日本株は押し目条件チェック）", { symbol: S }, ["symbol"]),
+    fn("get_fundamentals", "財務・バリュエーション（PER・PBR・配当・成長率・ROE・目標株価・決算日）", { symbol: S }, ["symbol"]),
+    fn("compare_assets", "複数銘柄の比較（騰落率・ボラ・最大下落・相関）", { symbols: SS, period: P }, ["symbols"]),
+    fn("get_sector_performance", "業種別騰落率ランキング", { market: { type: "string", enum: ["us", "japan"] }, period: P }, ["market"]),
+    fn("search_symbol", "会社名から銘柄コードを調べる（英語名推奨）", { query: { type: "string" } }, ["query"]),
+    fn("web_search", "Web検索。ニュース・決算・材料・経済指標・需給など最新情報", { query: { type: "string" } }, ["query"]),
+    fn("calculate", "計算（四則・べき乗・%）", { expression: { type: "string" } }, ["expression"]),
+    fn("watchlist", "ウォッチリストの表示・追加・削除", {
+      action: { type: "string", enum: ["show", "add", "remove"] }, symbols: SS, keyword: { type: "string", description: "削除対象（「全部」可）" },
+    }, ["action"]),
+    fn("price_alert", "価格アラートの登録・取消（画面を開いている間に通知）", {
+      action: { type: "string", enum: ["set", "cancel"] }, symbol: S, condition: { type: "string", enum: ["above", "below"] }, price: { type: "number" },
+      keyword: { type: "string", description: "取消対象（「全部」可）" },
+    }, ["action"]),
+    fn("alarm", "タイマー・リマインダーの設定・取消", {
+      action: { type: "string", enum: ["timer", "reminder", "cancel"] }, seconds: { type: "integer" },
+      datetime: { type: "string", description: "日本時間 YYYY-MM-DDTHH:MM" }, label: { type: "string", description: "名前・内容（取消は対象名、「全部」可）" },
+    }, ["action"]),
+    fn("notes", "メモ・ToDoの追加削除、ユーザーについての記憶・忘却", {
+      action: { type: "string", enum: ["memo_add", "memo_delete", "remember", "forget"] }, text: { type: "string", description: "内容（削除・忘却は一部の語、「全部」可）" },
+    }, ["action", "text"]),
+    fn("get_weather", "天気・気温・降水確率", {
+      location: { type: "string", description: `ローマ字の地名（既定 ${DEFAULT_LOCATION}）` }, country_code: { type: "string" }, days: { type: "integer" },
     }),
-    fn("get_quotes", "指定した銘柄・指数・為替などの現在値と前日比を取得する（最大12件）。", {
-      symbols: { type: "array", items: { type: "string" }, description: SYM },
-    }, ["symbols"]),
-    fn("analyze_stock", "個別銘柄・指数・為替のテクニカル分析を行う（騰落率、移動平均と乖離・傾き、パーフェクトオーダー、RSI、MACD、ボリンジャー、ATR、ボラティリティ、52週高安、出来高、指数との相関・ベータ、日本株は押し目買い手法のチャート条件チェック）。", {
-      symbol: { type: "string", description: SYM },
-    }, ["symbol"]),
-    fn("get_fundamentals", "個別株の財務・バリュエーション（時価総額、PER、PBR、配当利回り、配当性向、成長率、利益率、ROE、負債、アナリスト目標株価、次回決算日など）を取得する。", {
-      symbol: { type: "string", description: SYM },
-    }, ["symbol"]),
-    fn("compare_assets", "複数の銘柄・指数・為替を比較する（期間騰落率、ボラティリティ、最大下落率、RSI、相互の相関）。", {
-      symbols: { type: "array", items: { type: "string" }, description: "2〜6件。" + SYM },
-      period: { type: "string", description: "1d / 1w / 1m / 3m / 6m / 1y / ytd（省略時 3m）" },
-    }, ["symbols"]),
-    fn("get_sector_performance", "業種（セクター）別の騰落率ランキングを取得する。どの業種が強い・弱いかを見るときに使う。", {
-      market: { type: "string", description: "us（S&P500セクター）または japan（TOPIX-17業種）" },
-      period: { type: "string", description: "1d / 1w / 1m / 3m / 6m / 1y / ytd（省略時 1d）" },
-    }, ["market"]),
-    fn("search_symbol", "会社名・指数名から銘柄コードを調べる。", {
-      query: { type: "string", description: "会社名など（英語名の方が見つかりやすい。例: Toyota, Lasertec）" },
-    }, ["query"]),
-    fn("get_watchlist", "ユーザーのウォッチリスト全銘柄の現在値と前日比を取得する。"),
-    fn("add_watchlist", "ウォッチリストに銘柄を追加する。", {
-      symbols: { type: "array", items: { type: "string" }, description: SYM },
-    }, ["symbols"]),
-    fn("remove_watchlist", "ウォッチリストから銘柄を外す。", {
-      keyword: { type: "string", description: "銘柄コードか名前の一部。全部なら「全部」" },
-    }, ["keyword"]),
-    fn("set_price_alert", "価格アラートを登録する（指定の価格を上回った/下回ったら声で知らせる。画面を開いている間、約2分ごとに確認）。", {
-      symbol: { type: "string", description: SYM },
-      condition: { type: "string", enum: ["above", "below"], description: "above=以上になったら / below=以下になったら" },
-      price: { type: "number", description: "基準の価格" },
-    }, ["symbol", "condition", "price"]),
-    fn("cancel_price_alert", "価格アラートを取り消す。", {
-      keyword: { type: "string", description: "銘柄コードか名前の一部。全部なら「全部」" },
-    }, ["keyword"]),
-    fn("get_weather", "天気・気温・降水確率を調べる。傘が要るか、服装の相談などにも使う。", {
-      location: { type: "string", description: `地名をローマ字/英語で（例: Fukui, Kumamoto, Obama, Tokyo, Honolulu）。省略時は ${DEFAULT_LOCATION}` },
-      country_code: { type: "string", description: "国コード（日本ならJP。海外なら US など）。省略時はJP" },
-      days: { type: "integer", description: "何日先まで（1〜7）。省略時は3" },
-    }),
-    fn("web_search", "最新情報をWebで調べる。ニュース、株価・為替、営業時間、制度や商品の最新情報など、知識が古い可能性があるものは必ずこれを使う。", {
-      query: { type: "string", description: "調べたい内容（日本語でよい）" },
-    }, ["query"]),
-    fn("calculate", "計算をする（四則演算・べき乗・%）。金額や利回りの計算は暗算せずこれを使う。", {
-      expression: { type: "string", description: "数式。例: (1200000*0.03)/12, 2^10" },
-    }, ["expression"]),
-    fn("set_timer", "タイマーをセットする（〇分後に知らせる）", {
-      seconds: { type: "integer", description: "何秒後か" },
-      label: { type: "string", description: "タイマーの名前（例: パスタ）。省略可" },
-    }, ["seconds"]),
-    fn("set_reminder", "指定した日時に声で知らせるリマインダーを登録する（この画面を開いている間に知らせる）", {
-      datetime: { type: "string", description: "日本時間の日時 YYYY-MM-DDTHH:MM（例: 2026-10-18T09:30）" },
-      message: { type: "string", description: "知らせる内容" },
-    }, ["datetime", "message"]),
-    fn("cancel_alarm", "タイマーやリマインダーを取り消す", {
-      keyword: { type: "string", description: "取り消すものの名前の一部。全部消すなら「全部」" },
-    }, ["keyword"]),
-    fn("remember", "ユーザーについて今後も覚えておくべきこと（好み・家族・決まりごと等）を記憶する。ユーザーに「覚えて」と言われたとき使う。", {
-      fact: { type: "string", description: "覚える内容（短い一文）" },
-    }, ["fact"]),
-    fn("forget", "記憶していることを忘れる", {
-      keyword: { type: "string", description: "忘れる内容の一部。全部なら「全部」" },
-    }, ["keyword"]),
-    fn("add_memo", "メモ・ToDo・買い物リストに追加する", {
-      text: { type: "string", description: "メモの内容" },
-    }, ["text"]),
-    fn("delete_memo", "メモを消す（完了したToDoなど）", {
-      keyword: { type: "string", description: "消すメモの一部。全部なら「全部」" },
-    }, ["keyword"]),
   ];
-  if (ICS_URL) {
-    list.push(fn("get_calendar", "Googleカレンダーの予定を調べる。今日・明日・今週の予定、空いている時間などを聞かれたら使う。", {
-      date_from: { type: "string", description: "開始日 YYYY-MM-DD（日本時間）" },
-      date_to: { type: "string", description: "終了日 YYYY-MM-DD（この日を含む）" },
-    }, ["date_from"]));
-  }
+  if (ICS_URL) list.push(fn("get_calendar", "Googleカレンダーの予定（読むだけ）", { date_from: { type: "string", description: "YYYY-MM-DD" }, date_to: { type: "string" } }, ["date_from"]));
   return list;
 }
 
@@ -411,6 +392,22 @@ const asList = (v) => (Array.isArray(v) ? v : typeof v === "string" ? v.split(/[
 
 async function runTool(key, name, a, ctx) {
   switch (name) {
+    // まとめた道具 → 個別の処理へ
+    case "watchlist":
+      if (a.action === "add") return runTool(key, "add_watchlist", a, ctx);
+      if (a.action === "remove") return runTool(key, "remove_watchlist", { keyword: a.keyword || asList(a.symbols).join(",") }, ctx);
+      return runTool(key, "get_watchlist", a, ctx);
+    case "price_alert":
+      return runTool(key, a.action === "cancel" ? "cancel_price_alert" : "set_price_alert", { ...a, keyword: a.keyword || a.symbol }, ctx);
+    case "alarm":
+      if (a.action === "timer") return runTool(key, "set_timer", a, ctx);
+      if (a.action === "reminder") return runTool(key, "set_reminder", { datetime: a.datetime, message: a.label }, ctx);
+      return runTool(key, "cancel_alarm", { keyword: a.label || "全部" }, ctx);
+    case "notes":
+      if (a.action === "memo_add") return runTool(key, "add_memo", { text: a.text }, ctx);
+      if (a.action === "memo_delete") return runTool(key, "delete_memo", { keyword: a.text }, ctx);
+      if (a.action === "remember") return runTool(key, "remember", { fact: a.text }, ctx);
+      return runTool(key, "forget", { keyword: a.text }, ctx);
     case "get_market_overview": return market.overviewText(a.region || "all");
     case "get_quotes": return market.quotesText(asList(a.symbols));
     case "analyze_stock": return market.analyzeText(a.symbol);
@@ -432,7 +429,8 @@ async function runTool(key, name, a, ctx) {
       return (ok.length ? `追加しました: ${ok.map((x) => `${x.name}(${x.s})`).join("、")}` : "") + (bad.length ? ` 見つからなかった銘柄: ${bad.join("、")}` : "");
     }
     case "remove_watchlist": {
-      const hit = matchList(ctx.watchlist, market.normalizeSymbol(a.keyword) || a.keyword).concat(matchList(ctx.watchlist, a.keyword));
+      const keys = String(a.keyword || "").split(/[,、\s]+/).filter(Boolean);
+      const hit = keys.flatMap((k) => matchList(ctx.watchlist, market.normalizeSymbol(k) || k).concat(matchList(ctx.watchlist, k)));
       const uniq = [...new Set(hit)];
       if (!uniq.length) return "該当する銘柄はウォッチリストにありません。";
       ctx.actions.push({ type: "watch_remove", symbols: uniq });
@@ -567,7 +565,7 @@ function systemPrompt(state, voiceOnly) {
     "「今日の相場は」→ get_market_overview と、必要に応じて web_search（今日の相場の主な材料）。",
     "個別銘柄 → analyze_stock（テクニカル）と get_fundamentals（バリュエーション）、材料は web_search。日本株は押し目買い手法のチャート条件チェックの結果も伝える。",
     "「〜と比べて」→ compare_assets。「どの業種が強い」→ get_sector_performance。",
-    "銘柄コードが分からないときは search_symbol。日本株は 4桁コード＋.T。",
+    "銘柄コードの書き方: 日本株は証券コード＋.T（7203.T）、米国株はティッカー（NVDA）、指数は ^N225 ^GSPC ^IXIC ^DJI ^SOX、為替は USDJPY=X、米10年金利は ^TNX、金 GC=F、原油 CL=F、ビットコイン BTC-USD。分からなければ search_symbol。",
     "",
     "【返答の形式】",
     "声で会話しているので、最初に、読み上げ用の結論を自然な話し言葉で2〜4文で言う（記号・箇条書き・URLを使わない。数値は要点の2〜3個まで）。",
@@ -576,7 +574,7 @@ function systemPrompt(state, voiceOnly) {
     "音声認識の誤変換が混じるので、銘柄名などは意味が通るように汲み取る（例:「エヌビディア」→NVDA、「ドル円」→USDJPY=X、「日経」→^N225）。",
     "",
     "【その他の道具】",
-    "タイマー、リマインダー、メモ、記憶、ウォッチリスト、価格アラートは、頼まれたら道具で実行し、実行したことを短く伝える。",
+    "タイマー・リマインダー（alarm）、メモ・記憶（notes）、ウォッチリスト（watchlist）、価格アラート（price_alert）は、頼まれたら道具で実行し、実行したことを短く伝える。",
     ICS_URL ? "予定を聞かれたら get_calendar を使う（読むだけ）。" : "カレンダーは未接続。予定を聞かれたら、未接続だと伝える。",
     "分からないこと・できないことは正直に言う。",
     "",
@@ -665,9 +663,9 @@ async function handler(req, res) {
         id: String(x.id), symbol: String(x.symbol), name: String(x.name || "").slice(0, 60), cond: x.cond === "below" ? "below" : "above", price: +x.price,
       })).slice(0, 30),
     };
-    const history = (Array.isArray(body.history) ? body.history : []).slice(-8).map((m) => ({
+    const history = (Array.isArray(body.history) ? body.history : []).slice(-6).map((m) => ({
       role: m && m.role === "assistant" ? "assistant" : "user",
-      content: String((m && m.content) || "").slice(0, m && m.role === "assistant" ? 1800 : 600),
+      content: String((m && m.content) || "").slice(0, m && m.role === "assistant" ? 900 : 400),
     }));
 
     const tools = toolDefs();
@@ -688,7 +686,7 @@ async function handler(req, res) {
         try { return await runTool(key, c.function.name, args, ctx); }
         catch (e) { return "道具の実行に失敗しました: " + String(e.message || e).slice(0, 200); }
       }));
-      calls.forEach((c, i) => messages.push({ role: "tool", tool_call_id: c.id, content: String(results[i]) }));
+      calls.forEach((c, i) => messages.push({ role: "tool", tool_call_id: c.id, content: String(results[i]).slice(0, 3000) }));
     }
     if (!reply) {
       const msg = await chat(key, messages, tools, true);
@@ -699,10 +697,10 @@ async function handler(req, res) {
     if (voiceOnly) { res.setHeader("Content-Type", "text/plain; charset=utf-8"); return res.status(200).send(speech); }
     return res.status(200).json({ heard, reply: speech, detail, actions: ctx.actions, tools: [...new Set(used)] });
   } catch (e) {
-    return fail(500, voiceOnly ? "すみません、エラーが起きました。少し待ってからもう一度お願いします。" : "サーバーエラー", { detail: String(e.message || e).slice(0, 300) });
+    return fail(500, voiceOnly ? "すみません、" + (e.friendly || "エラーが起きました") + "。" : (e.friendly || "サーバーエラー"), { detail: String(e.message || e).slice(0, 400) });
   }
 }
 
 module.exports = handler;
 // テスト用
-module.exports._internal = { parseIcs, expandEvent, calculate, parseWhen, cleanReply, splitReply, systemPrompt, runTool, getCalendar };
+module.exports._internal = { toolDefs, parseIcs, expandEvent, calculate, parseWhen, cleanReply, splitReply, systemPrompt, runTool, getCalendar };
